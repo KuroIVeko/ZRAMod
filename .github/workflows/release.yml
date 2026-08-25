@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          zip -r ZRAMod-${VERSION}.zip . \
+            -x '.git/*' '.github/*' '*.zip' 'README.md'
+          echo "--- zip 根目录内容 ---"
+          unzip -l ZRAMod-${VERSION}.zip | head -20
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ZRAMod-*.zip
