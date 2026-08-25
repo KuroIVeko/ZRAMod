@@ -211,6 +211,12 @@
     </div>
     <div class="hint" style="margin-bottom:10px;">大小超过物理内存时不会被拦截，但会在下方提示；这两个内核参数值越大，系统会越"激进"地使用 swap，请结合自己设备实际情况调整。</div>
 
+    <div class="field">
+      <label for="f-boot-delay">开机后延迟补写 swappiness/watermark_scale_factor（秒）</label>
+      <input type="number" id="f-boot-delay" min="0" max="120" step="1" value="20">
+      <div class="hint">部分设备/ROM 会在开机较晚的阶段（观察到大约是开机完成后 10 秒左右）用系统默认值把这两个参数覆盖掉。这里设置的是"开机完成后再等多久才补写一次"，需要比那个覆盖发生的时间晚一点才能生效；如果重启后过一会儿又变回默认值，调大这个数值再试。</div>
+    </div>
+
     <div class="btn-row">
       <button type="submit" class="primary" id="btn-apply">保存并立即应用</button>
     </div>
@@ -310,12 +316,6 @@
     if (prev && algos.indexOf(prev) !== -1) sel.value = prev;
   }
 
-  function applySavedConfigToForm(cfg) {
-    if (formPrefilled) return;
-    if (!cfg || cfg.CONFIG_EXISTS !== "true") return;
-    formPrefilled = true;
-  }
-
   function loadSavedConfig() {
     return exec("cat " + DATADIR + "/config.conf 2>/dev/null").then(function (r) {
       var cfg = parseKV(r.stdout);
@@ -327,6 +327,7 @@
         if (cfg.ZRAM_PRIORITY) document.getElementById("f-priority").value = cfg.ZRAM_PRIORITY;
         if (cfg.VM_SWAPPINESS) document.getElementById("f-swappiness").value = cfg.VM_SWAPPINESS;
         if (cfg.VM_WATERMARK_SCALE_FACTOR) document.getElementById("f-wsf").value = cfg.VM_WATERMARK_SCALE_FACTOR;
+        if (cfg.BOOT_SYSCTL_DELAY_SEC) document.getElementById("f-boot-delay").value = cfg.BOOT_SYSCTL_DELAY_SEC;
       }
     });
   }
@@ -372,6 +373,7 @@
     var priority = parseInt(document.getElementById("f-priority").value, 10);
     var swappiness = parseInt(document.getElementById("f-swappiness").value, 10);
     var wsf = parseInt(document.getElementById("f-wsf").value, 10);
+    var bootDelay = parseInt(document.getElementById("f-boot-delay").value, 10);
 
     if (!algo || lastAlgos.indexOf(algo) === -1) return { error: "请选择一个设备支持的压缩算法" };
     if (!sizeGiB || sizeGiB <= 0) return { error: "请填写有效的容量大小" };
@@ -381,6 +383,8 @@
     swappiness = Math.min(200, Math.max(0, swappiness));
     if (isNaN(wsf)) wsf = 10;
     wsf = Math.min(1000, Math.max(1, wsf));
+    if (isNaN(bootDelay)) bootDelay = 20;
+    bootDelay = Math.min(120, Math.max(0, bootDelay));
 
     var sizeBytes = Math.round(sizeGiB * 1073741824);
 
@@ -389,7 +393,8 @@
       sizeBytes: sizeBytes,
       priority: priority,
       swappiness: swappiness,
-      wsf: wsf
+      wsf: wsf,
+      bootDelay: bootDelay
     };
   }
 
@@ -407,7 +412,8 @@
       "ZRAM_SIZE_BYTES=" + values.sizeBytes,
       "ZRAM_PRIORITY=" + values.priority,
       "VM_SWAPPINESS=" + values.swappiness,
-      "VM_WATERMARK_SCALE_FACTOR=" + values.wsf
+      "VM_WATERMARK_SCALE_FACTOR=" + values.wsf,
+      "BOOT_SYSCTL_DELAY_SEC=" + (values.bootDelay === undefined ? 20 : values.bootDelay)
     ];
     var printfArgs = lines.map(shQuote).join(" ");
     var cmd = "mkdir -p " + DATADIR +
