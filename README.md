@@ -25,6 +25,14 @@
 
 如果你在其他设备上装过、结果如何，欢迎反馈。
 
+## 已知限制：post-fs-data.sh 理论上可能拖住开机
+
+`post-fs-data.sh` 里的 `swapoff`/`reset`/`mkswap`/`swapon` 这几步会阻塞式地跑（这是刻意的，为了让 zram 在 Zygote 启动前就绪）。查过 KernelSU 源码（`userspace/ksud/src/init_event.rs` 的 `on_post_data_fs()`，源码里这一行前面就是 `// TODO: Add timeout`）确认：**KernelSU 目前对模块的 post-fs-data.sh 执行没有任何超时保护**，如果这几步里有一步真的卡进内核不可中断睡眠（极端内存压力下 `zram_reset_device()`/`zram_meta_alloc()` 理论上可以走到这种路径），整个开机流程会被拖住。
+
+脚本里给 `swapoff`/`mkswap`/`swapon` 包了 `timeout`，但这层保护只能拦住"卡在用户态"的挂起（等锁、等资源），对内核不可中断睡眠无效——这是明确知道、接受下来的残余风险，不是没处理。之所以还是选择留在 `post-fs-data.sh` 而不挪到非阻塞的 `service.sh`，是因为这个场景（开机这一刻、系统内存就已经很紧张）概率很低，权衡下来更看重 zram 尽早就绪。如果之后实测中出现开机异常卡顿，这是第一个要怀疑的地方，可以考虑把 zram 重建部分挪到 `service.sh`。
+
+除了选阶段和包 `timeout`，还有一层更直接的保护：`swapoff` 要把 zram 里已经压缩驻留的数据全部搬回真实内存才能返回，用量越大越慢、内存越紧张越可能真的堵住，这是实际拖慢/堵住 `swapoff` 的主因。所以重建前会先读 `/proc/swaps` 里 zram0 当前的已用量（KB），超过阈值（默认 1GiB，可在 `config.conf` 用 `SWAP_USAGE_SKIP_KB` 调整）就直接跳过这次重建、保持现状不动，而不是硬着头皮上——这一条对开机自动应用、`service.sh` 补偿重试、WebUI 热应用是同一份逻辑，因为都走同一个 `do_rebuild`。跳过时会在日志里写清楚 `swap_usage_too_high`；如果一直触发（比如 `swappiness` 设得很激进、zram 常年占用很高），需要先关几个应用释放内存，或者调大这个阈值。
+
 ## 使用方法
 
 1. 用 KernelSU 管理器安装模块并重启。
