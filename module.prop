@@ -2,5 +2,5 @@ id=zramod
 name=Zramod
 version=v0.1.0
 versionCode=1
-author=axiumhikari
+author=SumiYune
 description=自定义 zram 压缩算法/大小/swappiness/watermark_scale_factor，nomount，开机自动应用且支持不重启热应用
