@@ -162,12 +162,17 @@ do_rebuild() {
   # 内存越紧张越可能真的堵住（这才是实质性降低"卡在 swapoff 里"概率的手段，选 post-fs-data
   # 这个阶段只是选了个通常风险较低的时机，不等于消除了风险）。这里直接检查当前用量，
   # 超过阈值就不动手，跟"失败"一样处理，而不是硬着头皮上。阈值可以在 config.conf 里用
-  # SWAP_USAGE_SKIP_KB 调整（单位 KB），默认 1GiB。
+  # SWAP_USAGE_SKIP_KB 调整（单位 KB），默认 1GiB；设成 unlimited 则完全关闭这项检查
+  # （WebUI 里对应"不限制"档位，选它之前会展示清楚的风险说明）。
   SWAP_USAGE_SKIP_KB=""
   [ -f "$CONF" ] && . "$CONF" 2>/dev/null
-  case "$SWAP_USAGE_SKIP_KB" in
-    ''|*[!0-9]*) SWAP_USAGE_SKIP_KB=1048576 ;;
-  esac
+  if [ "$SWAP_USAGE_SKIP_KB" = "unlimited" ]; then
+    SWAP_USAGE_SKIP_KB=""
+  else
+    case "$SWAP_USAGE_SKIP_KB" in
+      ''|*[!0-9]*) SWAP_USAGE_SKIP_KB=1048576 ;;
+    esac
+  fi
 
   if [ ! -d "$ZSYS" ]; then
     log "错误: 未找到 $ZSYS，设备可能没有 zram0，跳过 zram 相关设置"
@@ -176,8 +181,8 @@ do_rebuild() {
 
   if [ "$zram_ok" -eq 1 ] && is_swapon; then
     used_kb="$(swap_used_kb)"
-    if is_uint "$used_kb" && [ "$used_kb" -gt "$SWAP_USAGE_SKIP_KB" ]; then
-      log "警告: 当前 zram 已用 ${used_kb}KB，超过安全阈值 ${SWAP_USAGE_SKIP_KB}KB，swapoff 需要把这些数据搬回内存可能很慢甚至阻塞，本次跳过重建、保持现状不动。可以先释放内存（关掉几个应用）或稍后再试；阈值可在 config.conf 的 SWAP_USAGE_SKIP_KB 调整"
+    if [ -n "$SWAP_USAGE_SKIP_KB" ] && is_uint "$used_kb" && [ "$used_kb" -gt "$SWAP_USAGE_SKIP_KB" ]; then
+      log "警告: 当前 zram 已用 ${used_kb}KB，超过安全阈值 ${SWAP_USAGE_SKIP_KB}KB，swapoff 需要把这些数据搬回内存可能很慢甚至阻塞，本次跳过重建、保持现状不动。可以先释放内存（关掉几个应用）或稍后再试；阈值可在 config.conf 的 SWAP_USAGE_SKIP_KB 调整，设成 unlimited 可关闭此检查（有风险）"
       zram_ok=0; zram_msg="swap_usage_too_high"
     else
       run_bounded 5 swapoff "$ZDEV" >>"$LOG" 2>&1
@@ -377,6 +382,7 @@ cmd_detect() {
   echo "CURRENT_WSF=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null)"
   if is_swapon; then echo "CURRENT_SWAPON=true"; else echo "CURRENT_SWAPON=false"; fi
   echo "CURRENT_PRIORITY=$(swap_priority)"
+  echo "CURRENT_USED_KB=$(swap_used_kb)"
   if [ -f "$CONF" ]; then echo "CONFIG_EXISTS=true"; else echo "CONFIG_EXISTS=false"; fi
   if [ -f "$ORIG" ]; then echo "ORIGINAL_EXISTS=true"; else echo "ORIGINAL_EXISTS=false"; fi
 }
