@@ -173,6 +173,12 @@
     <div class="kv"><div class="k">swappiness</div><div class="v" id="s-swappiness">-</div></div>
     <div class="kv"><div class="k">watermark_scale_factor</div><div class="v" id="s-wsf">-</div></div>
     <div class="kv"><div class="k">物理内存</div><div class="v" id="s-mem">-</div></div>
+    <div class="kv"><div class="k">二次压缩算法</div><div class="v" id="s-recomp-algo">-</div></div>
+    <div class="kv"><div class="k">二次压缩守护进程</div><div class="v" id="s-recomp-daemon">-</div></div>
+  </div>
+  <div class="kv" style="margin-top:8px;">
+    <div class="k">上次二次压缩</div>
+    <div class="v" id="s-recomp-last">-</div>
   </div>
   <div class="kv" style="margin-top:8px;">
     <div class="k">上次操作结果</div>
@@ -225,6 +231,33 @@
       <label for="f-boot-delay">开机后延迟补写 swappiness/watermark_scale_factor（秒）</label>
       <input type="number" id="f-boot-delay" min="0" max="120" step="1" value="20">
       <div class="hint">部分设备/ROM 会在开机较晚的阶段（观察到大约是开机完成后 10 秒左右）用系统默认值把这两个参数覆盖掉。这里设置的是"开机完成后再等多久才补写一次"，需要比那个覆盖发生的时间晚一点才能生效；如果重启后过一会儿又变回默认值，调大这个数值再试。</div>
+    </div>
+
+    <div class="field">
+      <label for="f-recomp-enabled">空闲页二次压缩（recompress）</label>
+      <select id="f-recomp-enabled">
+        <option value="false">关闭</option>
+        <option value="true">开启</option>
+      </select>
+      <div class="hint">主算法负责日常换入换出，后台定期把一段时间没被访问过的页用下面的次级算法重新压一遍，重压后没变小的页保持原样。适合"主算法选快的（lz4/lz4k）、次级算法选压缩率高的（zstd）"的组合。需要内核支持 CONFIG_ZRAM_MULTI_COMP；次级算法只能在 zram 重建时注册，注册失败只会记日志、不影响 zram 本身。</div>
+    </div>
+
+    <div id="f-recomp-wrap" class="hidden">
+      <div class="row2">
+        <div class="field">
+          <label for="f-recomp-algo">次级算法</label>
+          <select id="f-recomp-algo"></select>
+        </div>
+        <div class="field">
+          <label for="f-recomp-interval">间隔（分钟，≥5）</label>
+          <input type="number" id="f-recomp-interval" min="5" max="1440" step="1" value="60">
+        </div>
+      </div>
+      <div class="field">
+        <label for="f-recomp-threshold">只重压压缩后不小于多少字节的页（0 = 不限）</label>
+        <input type="number" id="f-recomp-threshold" min="0" max="4096" step="1" value="0">
+        <div class="hint">页大小 4096 字节。本来就压得很小的页重压也省不了多少，设个阈值（例如 1024）可以少做无用功。每轮会把"上一轮标记后一直没被访问过"的页重压，以最低 CPU 优先级在后台执行。</div>
+      </div>
     </div>
 
     <div class="field">
@@ -374,7 +407,24 @@
       sel.appendChild(opt);
     });
     if (prev && algos.indexOf(prev) !== -1) sel.value = prev;
+
+    var rsel = document.getElementById("f-recomp-algo");
+    var rprev = rsel.value || "zstd";
+    rsel.innerHTML = "";
+    algos.forEach(function (a) {
+      var opt = document.createElement("option");
+      opt.value = a;
+      opt.textContent = a;
+      rsel.appendChild(opt);
+    });
+    if (algos.indexOf(rprev) !== -1) rsel.value = rprev;
   }
+
+  function updateRecompUI() {
+    var on = document.getElementById("f-recomp-enabled").value === "true";
+    document.getElementById("f-recomp-wrap").classList.toggle("hidden", !on);
+  }
+  document.getElementById("f-recomp-enabled").addEventListener("change", updateRecompUI);
 
   function updateUsageModeUI() {
     var mode = document.getElementById("f-usage-mode").value;
@@ -410,6 +460,11 @@
           if (kbVal > 0) document.getElementById("f-usage-kb").value = Math.round(kbVal / 1024);
         }
         updateUsageModeUI();
+        document.getElementById("f-recomp-enabled").value = cfg.RECOMP_ENABLED === "true" ? "true" : "false";
+        if (cfg.RECOMP_ALGO && lastAlgos.indexOf(cfg.RECOMP_ALGO) !== -1) document.getElementById("f-recomp-algo").value = cfg.RECOMP_ALGO;
+        if (cfg.RECOMP_INTERVAL_MIN) document.getElementById("f-recomp-interval").value = cfg.RECOMP_INTERVAL_MIN;
+        if (cfg.RECOMP_THRESHOLD) document.getElementById("f-recomp-threshold").value = cfg.RECOMP_THRESHOLD;
+        updateRecompUI();
       }
     });
   }
@@ -433,6 +488,18 @@
       document.getElementById("s-wsf").textContent = d.CURRENT_WSF || "-";
       document.getElementById("s-mem").textContent = fmtKiBGiB(d.MEM_TOTAL_KB);
       document.getElementById("f-usage-current").textContent = fmtKiBAuto(d.CURRENT_USED_KB);
+      document.getElementById("s-recomp-algo").textContent = d.CURRENT_RECOMP_ALGO || "未注册";
+      document.getElementById("s-recomp-daemon").innerHTML = d.RECOMP_DAEMON === "true"
+        ? '<span class="badge ok">运行中</span>' : '<span style="color:var(--sub);">未运行</span>';
+      if (d.RECOMP_LAST_TIME) {
+        var savedKb = parseInt(d.RECOMP_LAST_SAVED_KB, 10);
+        document.getElementById("s-recomp-last").textContent = d.RECOMP_LAST_TIME
+          + " · 节省 " + (isNaN(savedKb) ? "-" : fmtKiBAuto(String(Math.max(0, savedKb))))
+          + " · 耗时 " + (d.RECOMP_LAST_DURATION_SEC || "-") + "s"
+          + (d.RECOMP_LAST_RC && d.RECOMP_LAST_RC !== "0" ? " · 返回码 " + d.RECOMP_LAST_RC : "");
+      } else {
+        document.getElementById("s-recomp-last").textContent = "（尚未执行）";
+      }
 
       lastStatusInfo = st;
       if (st.LAST_TIME) {
@@ -472,6 +539,15 @@
     if (isNaN(bootDelay)) bootDelay = 20;
     bootDelay = Math.min(120, Math.max(0, bootDelay));
     if (isNaN(usageMB) || usageMB <= 0) usageMB = 1024;
+    var recompEnabled = document.getElementById("f-recomp-enabled").value === "true";
+    var recompAlgo = document.getElementById("f-recomp-algo").value;
+    var recompInterval = parseInt(document.getElementById("f-recomp-interval").value, 10);
+    var recompThreshold = parseInt(document.getElementById("f-recomp-threshold").value, 10);
+    if (recompEnabled && recompAlgo === algo) return { error: "次级算法不能和主算法相同" };
+    if (isNaN(recompInterval)) recompInterval = 60;
+    recompInterval = Math.min(1440, Math.max(5, recompInterval));
+    if (isNaN(recompThreshold)) recompThreshold = 0;
+    recompThreshold = Math.min(4096, Math.max(0, recompThreshold));
 
     var sizeBytes = Math.round(sizeGiB * 1073741824);
     var usageSkipKb = usageMode === "unlimited" ? "unlimited" : String(usageMB * 1024);
@@ -483,7 +559,11 @@
       swappiness: swappiness,
       wsf: wsf,
       bootDelay: bootDelay,
-      usageSkipKb: usageSkipKb
+      usageSkipKb: usageSkipKb,
+      recompEnabled: recompEnabled,
+      recompAlgo: recompAlgo,
+      recompInterval: recompInterval,
+      recompThreshold: recompThreshold
     };
   }
 
@@ -503,7 +583,11 @@
       "VM_SWAPPINESS=" + values.swappiness,
       "VM_WATERMARK_SCALE_FACTOR=" + values.wsf,
       "BOOT_SYSCTL_DELAY_SEC=" + (values.bootDelay === undefined ? 20 : values.bootDelay),
-      "SWAP_USAGE_SKIP_KB=" + (values.usageSkipKb === undefined ? 1048576 : values.usageSkipKb)
+      "SWAP_USAGE_SKIP_KB=" + (values.usageSkipKb === undefined ? 1048576 : values.usageSkipKb),
+      "RECOMP_ENABLED=" + (values.recompEnabled ? "true" : "false"),
+      "RECOMP_ALGO=" + (values.recompAlgo || "zstd"),
+      "RECOMP_INTERVAL_MIN=" + (values.recompInterval === undefined ? 60 : values.recompInterval),
+      "RECOMP_THRESHOLD=" + (values.recompThreshold === undefined ? 0 : values.recompThreshold)
     ];
     var printfArgs = lines.map(shQuote).join(" ");
     var cmd = "mkdir -p " + DATADIR +

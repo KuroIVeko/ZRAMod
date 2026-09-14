@@ -1,7 +1,10 @@
 #!/system/bin/sh
 # Zramod 核心逻辑，被 post-fs-data.sh / service.sh / action.sh / boot-completed.sh / uninstall.sh / WebUI 共用
-# 用法: zram_apply.sh [apply|restore|detect]
+# 用法: zram_apply.sh [apply|restore|detect|sysctl|recomp-start|recomp-daemon|recomp-stop]
 #   apply   读取 /data/adb/zramod/config.conf 并应用（未配置或 ENABLED!=true 时什么都不做）
+#   recomp-start  在后台拉起空闲页二次压缩守护进程（已在运行则不重复启动），立即返回
+#   recomp-daemon 守护进程本体（不要手动前台调用）
+#   recomp-stop   停止守护进程
 #   restore 读取 /data/adb/zramod/original.conf，把 zram/内核参数恢复到首次接管前的状态
 #   detect  探测设备当前 zram 状态与支持的算法列表，以 key=value 的形式输出到 stdout
 
@@ -10,6 +13,8 @@ CONF="$DATADIR/config.conf"
 ORIG="$DATADIR/original.conf"
 LOG="$DATADIR/zramod.log"
 STATUS="$DATADIR/status.conf"
+RECOMP_PID="$DATADIR/recomp.pid"
+RECOMP_STATUS="$DATADIR/recomp_status.conf"
 
 ZDEV=/dev/block/zram0
 ZSYS=/sys/block/zram0
@@ -107,7 +112,151 @@ write_status() {
     echo "ACTUAL_WSF=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null)"
     if is_swapon; then echo "ACTUAL_SWAPON=true"; else echo "ACTUAL_SWAPON=false"; fi
     echo "ACTUAL_PRIORITY=$(swap_priority)"
+    echo "ACTUAL_RECOMP_ALGO=$(current_recomp_algo)"
   } > "$STATUS" 2>/dev/null
+}
+
+# ---- 空闲页二次压缩（recompress，内核 CONFIG_ZRAM_MULTI_COMP）----
+# 次级算法跟主算法一样，只能在 zram 初始化（写 disksize）之前注册，已初始化的设备写入会被内核拒绝
+# （一加/OPPO 的 HYB_ZRAM 驱动实测 dmesg: "Can't change algorithm for initialized device"）。
+# 所以注册只能放进 do_rebuild 的 reset 之后、disksize 之前。整个功能是"锦上添花"：任何一步失败
+# 都只记日志，绝不把 zram_ok 置 0，也绝不阻塞开机——重压本身只在 boot-completed 之后的后台守护进程里跑。
+
+# recomp_algorithm 的回读格式是每行 "#<priority>: <algos...>"，没注册时为空。
+# 厂商驱动格式可能不同，这里只取第一行里带 [] 的名字；没有 [] 时退化成去掉 "#N: " 前缀后的内容。
+current_recomp_algo() {
+  [ -r "$ZSYS/recomp_algorithm" ] || return 0
+  line="$(head -n 1 "$ZSYS/recomp_algorithm" 2>/dev/null)"
+  [ -n "$line" ] || return 0
+  a="$(echo "$line" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')"
+  [ -n "$a" ] || a="$(echo "$line" | sed 's/^#[0-9]*:[ ]*//')"
+  echo "$a"
+}
+
+register_recomp() {
+  # 调用前提：zram 已 reset、尚未写 disksize；配置已被 source 过
+  [ "$RECOMP_ENABLED" = "true" ] || return 0
+  if [ ! -e "$ZSYS/recomp_algorithm" ]; then
+    log "recompress: 内核没有 recomp_algorithm 节点（未开启 CONFIG_ZRAM_MULTI_COMP），跳过次级算法注册"
+    return 0
+  fi
+  ralgo="$RECOMP_ALGO"
+  [ -n "$ralgo" ] || ralgo=zstd
+  case " $(supported_algos) " in
+    *" $ralgo "*) ;;
+    *) log "recompress: 次级算法 $ralgo 不在设备支持列表内 ($(supported_algos))，跳过注册"; return 0 ;;
+  esac
+  if [ "$ralgo" = "$(current_algo)" ]; then
+    log "recompress: 次级算法 $ralgo 与主算法相同，重压没有意义，跳过注册"
+    return 0
+  fi
+  echo "algo=$ralgo priority=1" > "$ZSYS/recomp_algorithm" 2>>"$LOG"
+  got="$(current_recomp_algo)"
+  if [ "$got" = "$ralgo" ]; then
+    log "recompress: 已注册次级算法 $ralgo (priority=1)"
+  else
+    log "recompress: 注册次级算法 $ralgo 失败或回读不一致（回读: '${got}'），本次不启用二次压缩，zram 其余配置不受影响"
+  fi
+  return 0
+}
+
+recomp_daemon_running() {
+  [ -f "$RECOMP_PID" ] || return 1
+  pid="$(cat "$RECOMP_PID" 2>/dev/null)"
+  is_uint "$pid" || return 1
+  grep -q "recomp-daemon" "/proc/$pid/cmdline" 2>/dev/null
+}
+
+cmd_recomp_start() {
+  RECOMP_ENABLED=""; ENABLED=""
+  [ -f "$CONF" ] && . "$CONF"
+  [ "$ENABLED" = "true" ] && [ "$RECOMP_ENABLED" = "true" ] || return 0
+  recomp_daemon_running && return 0
+  # 所有 fd 都重定向掉，否则 WebUI 的 exec 桥接会一直等 stdout 关闭
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh "$0" recomp-daemon </dev/null >/dev/null 2>&1 &
+  else
+    nohup sh "$0" recomp-daemon </dev/null >/dev/null 2>&1 &
+  fi
+  return 0
+}
+
+cmd_recomp_stop() {
+  if recomp_daemon_running; then
+    pid="$(cat "$RECOMP_PID" 2>/dev/null)"
+    # 守护进程可能正处在内核 recompress 写入中，kill 会在那次写入结束后才生效，这里不等待
+    kill "$pid" 2>/dev/null
+    log "recompress: 已停止守护进程 (pid=$pid)"
+  fi
+  rm -f "$RECOMP_PID" 2>/dev/null
+}
+
+# mm_stat 第 2 列 compr_data_size，字节。可能超过 2^31，只交给 awk（双精度）算，不进 shell 算术。
+compr_bytes() {
+  awk '{print $2}' "$ZSYS/mm_stat" 2>/dev/null
+}
+
+cmd_recomp_daemon() {
+  if recomp_daemon_running; then
+    return 0
+  fi
+  echo $$ > "$RECOMP_PID"
+  sleep_pid=""
+  trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; rm -f "$RECOMP_PID"; exit 0' TERM INT
+  log "recompress: 守护进程启动 (pid=$$)"
+
+  marked=0
+  last_state=""
+  runs=0
+  while :; do
+    ENABLED=""; RECOMP_ENABLED=""; RECOMP_INTERVAL_MIN=""; RECOMP_THRESHOLD=""
+    [ -f "$CONF" ] && . "$CONF" 2>/dev/null
+    if [ "$ENABLED" != "true" ] || [ "$RECOMP_ENABLED" != "true" ]; then
+      log "recompress: 配置已关闭二次压缩，守护进程退出"
+      break
+    fi
+    case "$RECOMP_INTERVAL_MIN" in ''|*[!0-9]*) RECOMP_INTERVAL_MIN=60 ;; esac
+    [ "$RECOMP_INTERVAL_MIN" -lt 5 ] && RECOMP_INTERVAL_MIN=5
+    extra=""
+    is_uint "$RECOMP_THRESHOLD" && [ "$RECOMP_THRESHOLD" -gt 0 ] && extra=" threshold=$RECOMP_THRESHOLD"
+
+    ralgo="$(current_recomp_algo)"
+    if ! is_swapon || [ -z "$ralgo" ]; then
+      state="unavailable"
+      [ "$last_state" = "$state" ] || log "recompress: zram 未启用或没有注册次级算法（需要重新应用一次配置或重启才会注册），暂不执行，之后每轮会重新检查"
+      marked=0
+    else
+      state="active"
+      if [ "$marked" -eq 1 ]; then
+        before="$(compr_bytes)"
+        t0="$(date +%s)"
+        # 重压在写入进程的上下文里同步执行，用 nice 19 把 CPU 让给前台
+        nice -n 19 sh -c "echo 'type=idle$extra' > '$ZSYS/recompress'" 2>>"$LOG"
+        rc=$?
+        t1="$(date +%s)"
+        after="$(compr_bytes)"
+        saved_kb="$(awk -v b="$before" -v a="$after" 'BEGIN{ if (b==""||a=="") print ""; else printf "%d", (b-a)/1024 }')"
+        runs=$((runs + 1))
+        log "recompress: 第 ${runs} 轮 type=idle$extra algo=$ralgo rc=$rc 耗时 $((t1 - t0))s 压缩数据 ${before} -> ${after} 字节 (节省 ${saved_kb}KB)"
+        {
+          echo "RECOMP_LAST_TIME=$(date '+%Y-%m-%d %H:%M:%S')"
+          echo "RECOMP_LAST_RC=$rc"
+          echo "RECOMP_LAST_SAVED_KB=$saved_kb"
+          echo "RECOMP_LAST_DURATION_SEC=$((t1 - t0))"
+          echo "RECOMP_RUNS=$runs"
+        } > "$RECOMP_STATUS" 2>/dev/null
+      fi
+      # 标记当前所有页为 idle；之后被访问过的页内核会自动清掉标记，下一轮只重压这段时间内没被碰过的页
+      echo all > "$ZSYS/idle" 2>>"$LOG" && marked=1 || marked=0
+    fi
+    last_state="$state"
+    # 后台 sleep + wait：wait 能被 TERM 打断，recomp-stop 不用干等一整个周期
+    sleep $((RECOMP_INTERVAL_MIN * 60)) &
+    sleep_pid=$!
+    wait "$sleep_pid"
+    sleep_pid=""
+  done
+  rm -f "$RECOMP_PID"
 }
 
 apply_sysctls() {
@@ -146,14 +295,15 @@ snapshot_original() {
   log "已保存原始状态快照到 $ORIG"
 }
 
-# do_rebuild algo size priority doswapon
+# do_rebuild algo size priority doswapon [recomp]
+# 第 5 个参数为 recomp 时，在 reset 之后、disksize 之前按配置注册次级压缩算法（只有 apply 传，restore 不传）
 # 只负责 zram 设备本身这条链路（swapoff/reset/算法/大小/mkswap/swapon），不碰 swappiness/
 # watermark_scale_factor——那两个是否要写、写哪个值，是调用方（cmd_apply/cmd_restore）根据
 # 自己的语义决定的，不应该在这里被动跟着 zram_ok 走同一套规则，因为 apply 失败和 restore 失败
 # 对"该不该动 sysctl"的答案是不一样的，见 cmd_apply/cmd_restore 里的注释。
 # 任何一步失败只记录日志并尽量继续/安全退出，绝不让开机路径挂死
 do_rebuild() {
-  algo="$1"; size="$2"; prio="$3"; doswapon="$4"
+  algo="$1"; size="$2"; prio="$3"; doswapon="$4"; want_recomp="$5"
 
   zram_ok=1
   zram_msg="applied"
@@ -164,7 +314,7 @@ do_rebuild() {
   # 超过阈值就不动手，跟"失败"一样处理，而不是硬着头皮上。阈值可以在 config.conf 里用
   # SWAP_USAGE_SKIP_KB 调整（单位 KB），默认 1GiB；设成 unlimited 则完全关闭这项检查
   # （WebUI 里对应"不限制"档位，选它之前会展示清楚的风险说明）。
-  SWAP_USAGE_SKIP_KB=""
+  SWAP_USAGE_SKIP_KB=""; RECOMP_ENABLED=""; RECOMP_ALGO=""
   [ -f "$CONF" ] && . "$CONF" 2>/dev/null
   if [ "$SWAP_USAGE_SKIP_KB" = "unlimited" ]; then
     SWAP_USAGE_SKIP_KB=""
@@ -214,6 +364,10 @@ do_rebuild() {
         log "警告: 算法 $algo 不在设备支持列表内 ($(supported_algos))，跳过设置算法"
         ;;
     esac
+  fi
+
+  if [ "$zram_ok" -eq 1 ] && [ "$want_recomp" = "recomp" ] && is_uint "$size" && ! is_zero_str "$size"; then
+    register_recomp
   fi
 
   if [ "$zram_ok" -eq 1 ]; then
@@ -274,7 +428,7 @@ do_rebuild() {
   else
     write_status fail "$zram_msg"
   fi
-  log "本次操作完成: algo=$(current_algo) size=$(cat "$ZSYS/disksize" 2>/dev/null) swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null) wsf=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null) swapon=$(is_swapon && echo true || echo false)"
+  log "本次操作完成: algo=$(current_algo) recomp_algo=$(current_recomp_algo) size=$(cat "$ZSYS/disksize" 2>/dev/null) swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null) wsf=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null) swapon=$(is_swapon && echo true || echo false)"
   [ "$zram_ok" -eq 1 ] && return 0
   return 1
 }
@@ -286,6 +440,7 @@ cmd_apply() {
   fi
 
   ENABLED=""; ZRAM_ALGO=""; ZRAM_SIZE_BYTES=""; ZRAM_PRIORITY=""; VM_SWAPPINESS=""; VM_WATERMARK_SCALE_FACTOR=""; BOOT_SYSCTL_DELAY_SEC=""
+  RECOMP_ENABLED=""; RECOMP_ALGO=""; RECOMP_INTERVAL_MIN=""; RECOMP_THRESHOLD=""
   . "$CONF"
   log "读取到配置: ENABLED=$ENABLED ZRAM_ALGO=$ZRAM_ALGO ZRAM_SIZE_BYTES=$ZRAM_SIZE_BYTES ZRAM_PRIORITY=$ZRAM_PRIORITY VM_SWAPPINESS=$VM_SWAPPINESS VM_WATERMARK_SCALE_FACTOR=$VM_WATERMARK_SCALE_FACTOR BOOT_SYSCTL_DELAY_SEC=$BOOT_SYSCTL_DELAY_SEC"
 
@@ -300,7 +455,7 @@ cmd_apply() {
   fi
 
   snapshot_original
-  do_rebuild "$ZRAM_ALGO" "$ZRAM_SIZE_BYTES" "$ZRAM_PRIORITY" "true"
+  do_rebuild "$ZRAM_ALGO" "$ZRAM_SIZE_BYTES" "$ZRAM_PRIORITY" "true" "recomp"
   zram_result=$?
 
   # swappiness/watermark_scale_factor 只在确认"我们的 zram 配置真的生效了"之后才写新值。
@@ -313,6 +468,14 @@ cmd_apply() {
     apply_sysctls "$VM_SWAPPINESS" "$VM_WATERMARK_SCALE_FACTOR"
   else
     log "zram 配置未成功生效，本次不写入新的 swappiness/watermark_scale_factor（避免配到一个状态不明的 zram 上），系统当前值保持不变"
+  fi
+
+  # 二次压缩守护进程只在开机完成后拉起（post-fs-data 阶段由 boot-completed.sh 负责），
+  # 热应用时如果关掉了这个功能，守护进程会在下一轮读配置时自己退出；这里直接停掉更及时。
+  if [ "$RECOMP_ENABLED" = "true" ]; then
+    [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && cmd_recomp_start
+  else
+    cmd_recomp_stop
   fi
   return "$zram_result"
 }
@@ -355,6 +518,7 @@ cmd_restore() {
   ORIG_ALGO=""; ORIG_SIZE_BYTES=""; ORIG_SWAPPINESS=""; ORIG_WSF=""; ORIG_SWAPON=""; ORIG_PRIORITY=""
   . "$ORIG"
   log "开始恢复到本模块首次接管前的原始状态"
+  cmd_recomp_stop
   do_rebuild "$ORIG_ALGO" "$ORIG_SIZE_BYTES" "$ORIG_PRIORITY" "$ORIG_SWAPON"
   zram_result=$?
 
@@ -383,6 +547,9 @@ cmd_detect() {
   if is_swapon; then echo "CURRENT_SWAPON=true"; else echo "CURRENT_SWAPON=false"; fi
   echo "CURRENT_PRIORITY=$(swap_priority)"
   echo "CURRENT_USED_KB=$(swap_used_kb)"
+  echo "CURRENT_RECOMP_ALGO=$(current_recomp_algo)"
+  if recomp_daemon_running; then echo "RECOMP_DAEMON=true"; else echo "RECOMP_DAEMON=false"; fi
+  [ -f "$RECOMP_STATUS" ] && cat "$RECOMP_STATUS" 2>/dev/null
   if [ -f "$CONF" ]; then echo "CONFIG_EXISTS=true"; else echo "CONFIG_EXISTS=false"; fi
   if [ -f "$ORIG" ]; then echo "ORIGINAL_EXISTS=true"; else echo "ORIGINAL_EXISTS=false"; fi
 }
@@ -391,5 +558,8 @@ case "$1" in
   restore) cmd_restore ;;
   detect) cmd_detect ;;
   sysctl) cmd_sysctl ;;
+  recomp-start) cmd_recomp_start ;;
+  recomp-daemon) cmd_recomp_daemon ;;
+  recomp-stop) cmd_recomp_stop ;;
   *) cmd_apply ;;
 esac

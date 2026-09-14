@@ -24,3 +24,6 @@ sh "$MODDIR/common/zram_apply.sh" sysctl >> "$LOG" 2>&1
   echo "$(date '+%Y-%m-%d %H:%M:%S') boot-completed: 开机流程结束（延迟 ${BOOT_SYSCTL_DELAY_SEC}s 补写 sysctl 后），当前状态："
   sh "$MODDIR/common/zram_apply.sh" detect
 } >> "$LOG" 2>&1
+
+# 空闲页二次压缩守护进程（配置里没开就什么都不做）。后台运行、立即返回，不拖开机。
+sh "$MODDIR/common/zram_apply.sh" recomp-start >> "$LOG" 2>&1
