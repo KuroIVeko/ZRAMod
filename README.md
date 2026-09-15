@@ -23,6 +23,7 @@
 - `swapon` 在模块脚本环境里可能解析到不支持 `-p` 优先级参数的 BusyBox 实现（已做兼容处理：优先尝试 `/system/bin/swapon`，失败再退化为不带优先级重试）。
 - 部分 ROM 会在开机完成之后才把 `swappiness`/`watermark_scale_factor` 覆盖回默认值（一加 13 上实测大约在开机完成后 10 秒左右）。ZRAMod 会在 `boot-completed` 之后延迟一段时间再补写一次，默认延迟 20 秒，够用；如果你的设备上过一会儿又被覆盖回去了，说明覆盖发生得比这个延迟还晚，去 WebUI「开机后延迟补写…」那一项把秒数调大一些即可，不需要改代码。
 - 支持的压缩算法列表因设备/内核而异，模块会现场探测，不需要手动改代码。
+- 一加/OPPO 内核的 `oplus_bsp_zram_opt` 模块有自己的 `vm_swappiness`（实测默认 160），回收时很可能用的是它而不是 `/proc/sys/vm/swappiness`。检测到这个参数时，ZRAMod 会把 swappiness 同步写到这两处；`direct_vm_swappiness`（直接回收）和 `hybridswapd_swappiness` 保持厂商默认，不动。WebUI 状态栏显示为 `100 / 厂商 100`。
 
 如果你在其他设备上装过、结果如何，欢迎反馈。
 

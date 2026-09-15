@@ -259,16 +259,33 @@ cmd_recomp_daemon() {
   rm -f "$RECOMP_PID"
 }
 
+# 一加/OPPO 内核的 oplus_bsp_zram_opt 模块有自己的 vm_swappiness（实测默认 160），回收路径很可能
+# 用它而不是 /proc/sys/vm/swappiness，所以两处都写。只同步 vm_swappiness 这一个：
+# direct_vm_swappiness 管直接回收，调高会让前台卡顿；hybridswapd_swappiness 只在 hybridswap
+# 开启时有意义。这两个保持厂商默认，不动。
+OPLUS_VM_SWAPPINESS=/sys/module/oplus_bsp_zram_opt/parameters/vm_swappiness
+
+# 旧版本生成的 original.conf 没有这一项。只要本模块还没写过这个参数，此刻读到的就是厂商原值，
+# 可以补记；apply_sysctls 之前调用，保证补记发生在第一次写入之前。
+backfill_original_oplus() {
+  [ -f "$ORIG" ] && [ -e "$OPLUS_VM_SWAPPINESS" ] || return 0
+  grep -q '^ORIG_OPLUS_VM_SWAPPINESS=' "$ORIG" 2>/dev/null && return 0
+  echo "ORIG_OPLUS_VM_SWAPPINESS=$(cat "$OPLUS_VM_SWAPPINESS" 2>/dev/null)" >> "$ORIG"
+}
+
 apply_sysctls() {
-  # $1 = swappiness  $2 = watermark_scale_factor
+  # $1 = swappiness  $2 = watermark_scale_factor  [$3 = oplus vm_swappiness，默认同 $1]
   # 只负责写这两个 sysctl 本身，不判断"该不该写"——那是调用方的责任（见下面三处调用点的说明）。
-  sw="$1"; w="$2"
+  sw="$1"; w="$2"; osw="${3-$1}"
   if is_uint "$sw"; then
     echo "$sw" > /proc/sys/vm/swappiness 2>>"$LOG"
     if [ $? -ne 0 ] && [ "$sw" -gt 100 ]; then
       log "警告: swappiness=$sw 写入失败，回退到 100 重试"
       echo 100 > /proc/sys/vm/swappiness 2>>"$LOG"
     fi
+  fi
+  if is_uint "$osw" && [ -e "$OPLUS_VM_SWAPPINESS" ]; then
+    echo "$osw" > "$OPLUS_VM_SWAPPINESS" 2>>"$LOG" || log "警告: 写入 oplus vm_swappiness=$osw 失败"
   fi
   if is_uint "$w"; then
     [ "$w" -lt 1 ] && w=1
@@ -284,6 +301,7 @@ snapshot_original() {
     echo "ORIG_SIZE_BYTES=$(cat "$ZSYS/disksize" 2>/dev/null)"
     echo "ORIG_SWAPPINESS=$(cat /proc/sys/vm/swappiness 2>/dev/null)"
     echo "ORIG_WSF=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null)"
+    [ -e "$OPLUS_VM_SWAPPINESS" ] && echo "ORIG_OPLUS_VM_SWAPPINESS=$(cat "$OPLUS_VM_SWAPPINESS" 2>/dev/null)"
     if is_swapon; then
       echo "ORIG_SWAPON=true"
       echo "ORIG_PRIORITY=$(swap_priority)"
@@ -455,6 +473,7 @@ cmd_apply() {
   fi
 
   snapshot_original
+  backfill_original_oplus
   do_rebuild "$ZRAM_ALGO" "$ZRAM_SIZE_BYTES" "$ZRAM_PRIORITY" "true" "recomp"
   zram_result=$?
 
@@ -505,8 +524,9 @@ cmd_sysctl() {
     return 0
   fi
 
+  backfill_original_oplus
   apply_sysctls "$VM_SWAPPINESS" "$VM_WATERMARK_SCALE_FACTOR"
-  log "boot-completed 补写 sysctl: swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null) wsf=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null)"
+  log "boot-completed 补写 sysctl: swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null) oplus_vm_swappiness=$(cat "$OPLUS_VM_SWAPPINESS" 2>/dev/null) wsf=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null)"
 }
 
 cmd_restore() {
@@ -515,7 +535,7 @@ cmd_restore() {
     write_status fail "no_snapshot"
     return 1
   fi
-  ORIG_ALGO=""; ORIG_SIZE_BYTES=""; ORIG_SWAPPINESS=""; ORIG_WSF=""; ORIG_SWAPON=""; ORIG_PRIORITY=""
+  ORIG_ALGO=""; ORIG_SIZE_BYTES=""; ORIG_SWAPPINESS=""; ORIG_WSF=""; ORIG_SWAPON=""; ORIG_PRIORITY=""; ORIG_OPLUS_VM_SWAPPINESS=""
   . "$ORIG"
   log "开始恢复到本模块首次接管前的原始状态"
   cmd_recomp_stop
@@ -527,7 +547,8 @@ cmd_restore() {
   # 目的就是清除本模块留下的痕迹，这两个 sysctl 是我们改过的东西，理应无条件收回；如果因为
   # zram 设备那部分失败就连 sysctl 也不还原，会出现"模块都卸载了，swappiness 还停在
   # 自定义值，且以后再也没有 boot-completed 帮你补写"的更差状态。
-  apply_sysctls "$ORIG_SWAPPINESS" "$ORIG_WSF"
+  # 快照里没有 oplus 原值时传空串 = 不写，重启后厂商会自己设回默认
+  apply_sysctls "$ORIG_SWAPPINESS" "$ORIG_WSF" "$ORIG_OPLUS_VM_SWAPPINESS"
   [ "$zram_result" -eq 0 ] || log "警告: zram 设备部分未能恢复到原始状态，但 swappiness/watermark_scale_factor 已恢复"
   return "$zram_result"
 }
@@ -543,6 +564,7 @@ cmd_detect() {
   echo "CURRENT_SIZE_BYTES=$(cat "$ZSYS/disksize" 2>/dev/null)"
   echo "MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)"
   echo "CURRENT_SWAPPINESS=$(cat /proc/sys/vm/swappiness 2>/dev/null)"
+  echo "CURRENT_OPLUS_VM_SWAPPINESS=$(cat "$OPLUS_VM_SWAPPINESS" 2>/dev/null)"
   echo "CURRENT_WSF=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null)"
   if is_swapon; then echo "CURRENT_SWAPON=true"; else echo "CURRENT_SWAPON=false"; fi
   echo "CURRENT_PRIORITY=$(swap_priority)"

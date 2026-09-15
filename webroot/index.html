@@ -484,7 +484,8 @@
       document.getElementById("s-swapon").innerHTML = d.CURRENT_SWAPON === "true"
         ? '<span class="badge ok">已启用</span>' : '<span class="badge fail">未启用</span>';
       document.getElementById("s-prio").textContent = d.CURRENT_PRIORITY || "-";
-      document.getElementById("s-swappiness").textContent = d.CURRENT_SWAPPINESS || "-";
+      document.getElementById("s-swappiness").textContent = (d.CURRENT_SWAPPINESS || "-")
+        + (d.CURRENT_OPLUS_VM_SWAPPINESS ? " / 厂商 " + d.CURRENT_OPLUS_VM_SWAPPINESS : "");
       document.getElementById("s-wsf").textContent = d.CURRENT_WSF || "-";
       document.getElementById("s-mem").textContent = fmtKiBGiB(d.MEM_TOTAL_KB);
       document.getElementById("f-usage-current").textContent = fmtKiBAuto(d.CURRENT_USED_KB);
